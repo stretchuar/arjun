@@ -56,7 +56,8 @@
 <style>
 /* Single deliberate look: a dark holographic instrument overlay on the 3D scene.
    Layout: full-viewport canvas; top bar (title + modes); left style drawer; right data card
-   (bottom sheet on phones); joystick bottom-left in walk mode; position readout bottom-right. */
+   (bottom sheet on phones); joystick bottom-left in walk mode; position readout bottom-right.
+   View in VR is an extra mode button, hidden unless the browser can start immersive-vr. */
 :root{
   color-scheme: dark;
   --ink:#dff7ff; --dim:#86bcd2; --panel:rgba(3,14,26,.78); --solid:#03101d; --edge:rgba(127,220,255,.38);
@@ -78,6 +79,7 @@ button,select,input[type=color]{font:500 12px/1 var(--mono);letter-spacing:.06em
   clip-path:polygon(0 0,calc(100% - 7px) 0,100% 7px,100% 100%,7px 100%,0 calc(100% - 7px))}
 select{clip-path:none;max-width:46vw;background:var(--solid)}
 button[aria-pressed=true]{background:var(--ink);color:#03101d;border-color:var(--ink)}
+#mVR{color:#03101d;background:var(--accent);border-color:var(--accent)}
 button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 input[type=color]{padding:2px;width:44px;clip-path:none}
 .glass{background:var(--panel);border:1px solid var(--edge);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
@@ -1078,7 +1080,7 @@ input[type=color]{padding:2px;width:44px;clip-path:none}
     <button id="mOrbit" aria-pressed="true">Orbit</button>
     <button id="mWalk" aria-pressed="false">Walk</button>
     <button id="mTop">Top</button>
-    <button id="mVR" hidden>Enter VR</button>
+    <button id="mVR" hidden title="Stand inside the plant in a VR headset">View in VR</button>
   </div>
   <div class="grp">
     <select id="goto" aria-label="Go to machine or area"></select>
@@ -1390,8 +1392,10 @@ function select(id){
   hudText([SHORT[id]||m.short||id,m.box[2].toFixed(2)+' x '+m.box[3].toFixed(2)+' x '+m.h+' m','confidence: '+m.confidence]);
 }
 
-/* ---------- VR: head-locked data card + trace, thumbstick walk, trigger select ---------- */
-var hud=null,hudTrace=null;
+/* ---------- VR: 1:1 local-floor, thumbstick walk, snap turn, ray teleport ---------- */
+var hud=null,hudTrace=null,vrMark=null,vrHint=null,vrAimMat=null,vrCtrls=[],vrDown=[false,false],snapReady=true,vrLearned=false;
+var savedCamPos=new T.Vector3(),savedCamQuat=new T.Quaternion();
+var vrFwd=new T.Vector3(),vrRight=new T.Vector3(),vrHead=new T.Vector3(),vrRay=new T.Raycaster(),vrMat4=new T.Matrix4();
 function hudText(lines){
   if(hud){camera.remove(hud);hud.material.map.dispose();hud=null}
   if(!lines)return;
@@ -1399,30 +1403,155 @@ function hudText(lines){
   x.fillStyle='#fff';x.font='500 56px "Barlow Condensed","Arial Narrow",Arial,sans-serif';x.fillText(lines[0],26,74);x.font='34px "IBM Plex Mono",monospace';x.fillStyle='#cfefff';x.fillText(lines[1],26,138);x.fillText(lines[2],26,192);
   hud=new T.Sprite(new T.SpriteMaterial({map:new T.CanvasTexture(c),depthTest:false,transparent:true}));hud.scale.set(.64,.24,1);hud.position.set(-.38,-.22,-1.2);hud.renderOrder=9;hud.visible=renderer.xr.isPresenting;camera.add(hud);
 }
+function insideMachine(x,z,margin){
+  var id,m,b,minX,maxX,minZ,maxZ;
+  for(id in machines){m=machines[id].m;b=m.box;minX=b[0]-OX-margin;maxX=b[0]+b[2]-OX+margin;minZ=-(b[1]+b[3]-OY)-margin;maxZ=-(b[1]-OY)+margin;if(x>=minX&&x<=maxX&&z>=minZ&&z<=maxZ)return true}
+  return false;
+}
+function clearSpot(x,z){
+  var r,i,a,sx,sz;
+  if(!insideMachine(x,z,.5))return new T.Vector3(x,0,z);
+  for(r=1.5;r<=10;r+=1.5)for(i=0;i<8;i++){a=i*.785398;sx=x+Math.cos(a)*r;sz=z+Math.sin(a)*r;if(!insideMachine(sx,sz,.5))return new T.Vector3(sx,0,sz)}
+  return new T.Vector3(0,0,-2);
+}
+function vrEntryPoint(){
+  var p=new T.Vector3(),dx,dz,len,dist;
+  if(mode==='walk'){camera.getWorldPosition(p);return clearSpot(p.x,p.z)}
+  camera.getWorldPosition(p);dx=p.x-orb.t.x;dz=p.z-orb.t.z;len=Math.hypot(dx,dz);
+  if(len<.5){dx=0;dz=1;len=1}
+  dist=Math.min(5,Math.max(2.2,len*.35));
+  return clearSpot(orb.t.x+dx/len*dist,orb.t.z+dz/len*dist);
+}
+function thumbstick(gp){
+  if(!gp||!gp.axes||gp.axes.length<2)return null;
+  var x,y,x0,y0;
+  if(gp.axes.length>=4){x=gp.axes[2];y=gp.axes[3]}else{x=gp.axes[0];y=gp.axes[1]}
+  if(typeof x!=='number'||typeof y!=='number'||!isFinite(x)||!isFinite(y))return null;
+  if(gp.axes.length>=4&&Math.abs(x)<.05&&Math.abs(y)<.05){x0=gp.axes[0];y0=gp.axes[1];if(typeof x0==='number'&&typeof y0==='number'&&isFinite(x0)&&isFinite(y0)&&(Math.abs(x0)>.15||Math.abs(y0)>.15)){x=x0;y=y0}}
+  return {x:x,y:y};
+}
+function triggerDown(src){
+  var gp=src&&src.gamepad,b=gp&&gp.buttons&&gp.buttons[0];
+  if(!b)return false;
+  if(b.pressed)return true;
+  return typeof b.value==='number'&&b.value>.5;
+}
+function aimVR(obj){
+  vrMat4.extractRotation(obj.matrixWorld);
+  vrRay.ray.origin.setFromMatrixPosition(obj.matrixWorld);
+  vrRay.ray.direction.set(0,0,-1).applyMatrix4(vrMat4);
+}
+function classifyAim(){
+  var machine=null,floor=null,hits=vrRay.intersectObjects(pickList),o,d,t,x,z;
+  if(hits.length&&hits[0].distance<40)machine={dist:hits[0].distance,id:hits[0].object.userData.id};
+  o=vrRay.ray.origin;d=vrRay.ray.direction;
+  if(d.y<-.2){t=-o.y/d.y;if(t>=.8&&t<=30){x=o.x+d.x*t;z=o.z+d.z*t;if(!insideMachine(x,z,.2))floor={dist:t,x:x,z:z}}}
+  return {machine:machine,floor:floor};
+}
+function teleportTo(x,z){
+  camera.getWorldPosition(vrHead);
+  rig.position.x+=x-vrHead.x;rig.position.z+=z-vrHead.z;rig.position.y=0;
+  rig.updateMatrixWorld(true);
+}
 (function(){
   var g=new T.BufferGeometry();g.setAttribute('position',new T.Float32BufferAttribute([0,0,0,0,0,0],3));hudTrace=new T.Line(g,new T.LineBasicMaterial({color:S.acc}));hudTrace.frustumCulled=false;hudTrace.visible=false;scene.add(hudTrace);
   if(!navigator.xr||!navigator.xr.isSessionSupported)return;
   navigator.xr.isSessionSupported('immersive-vr').then(function(ok){
-    if(!ok)return;renderer.xr.enabled=true;var b=$('mVR');b.hidden=false;
-    [0,1].forEach(function(i){var c=renderer.xr.getController(i);var lg=new T.BufferGeometry();lg.setAttribute('position',new T.Float32BufferAttribute([0,0,0,0,0,-6],3));c.add(new T.Line(lg,new T.LineBasicMaterial({color:0xffffff})));rig.add(c);
-      c.addEventListener('selectstart',function(){var m=new T.Matrix4().extractRotation(c.matrixWorld);ray.ray.origin.setFromMatrixPosition(c.matrixWorld);ray.ray.direction.set(0,0,-1).applyMatrix4(m);var h=ray.intersectObjects(pickList);select(h.length?h[0].object.userData.id:null)})});
+    if(!ok)return;
+    renderer.xr.enabled=true;
+    var b=$('mVR');b.hidden=false;b.textContent='View in VR';
+    vrAimMat=new T.LineBasicMaterial({color:S.acc,depthTest:false,transparent:true});
+    vrMark=new T.Group();
+    var ringPts=[],k,a;
+    for(k=0;k<=40;k++){a=k/40*6.283185;ringPts.push(Math.cos(a)*.32,0,Math.sin(a)*.32)}
+    var ringG=new T.BufferGeometry();ringG.setAttribute('position',new T.Float32BufferAttribute(ringPts,3));
+    var ring=new T.Line(ringG,vrAimMat);ring.frustumCulled=false;vrMark.add(ring);
+    var crossG=new T.BufferGeometry();crossG.setAttribute('position',new T.Float32BufferAttribute([-.18,0,0,.18,0,0, 0,0,-.18,0,0,.18, 0,.02,0,0,.45,0],3));
+    var cross=new T.LineSegments(crossG,vrAimMat);cross.frustumCulled=false;vrMark.add(cross);
+    vrMark.visible=false;scene.add(vrMark);
+    var hc=document.createElement('canvas');hc.width=1024;hc.height=256;var hx=hc.getContext('2d');
+    hx.fillStyle='rgba(3,16,30,.72)';hx.fillRect(0,0,1024,256);hx.strokeStyle='#ffb43a';hx.lineWidth=8;hx.strokeRect(8,8,1008,240);
+    hx.fillStyle='#ffb43a';hx.font='600 44px "Barlow Condensed","Arial Narrow",Arial,sans-serif';hx.fillText('VIEW IN VR',40,70);
+    hx.fillStyle='#e8f7ff';hx.font='32px "IBM Plex Mono",ui-monospace,monospace';
+    hx.fillText('Left stick  walk      Right stick  snap turn',40,140);
+    hx.fillText('Trigger or pinch the floor to teleport',40,196);
+    var ht=new T.CanvasTexture(hc);ht.minFilter=T.LinearFilter;
+    vrHint=new T.Sprite(new T.SpriteMaterial({map:ht,depthTest:false,transparent:true}));
+    vrHint.scale.set(1.05,.26,1);vrHint.position.set(0,-.48,-1.7);vrHint.renderOrder=9;vrHint.frustumCulled=false;vrHint.visible=false;camera.add(vrHint);
+    [0,1].forEach(function(i){
+      var c=renderer.xr.getController(i),lg=new T.BufferGeometry();
+      lg.setAttribute('position',new T.Float32BufferAttribute([0,0,0,0,0,-8],3));
+      var line=new T.Line(lg,vrAimMat);line.frustumCulled=false;line.visible=false;c.add(line);c.userData.line=line;rig.add(c);vrCtrls[i]=c;
+    });
+    function endVR(){
+      b.textContent='View in VR';b.disabled=false;
+      rig.position.set(0,0,0);rig.rotation.set(0,0,0);
+      camera.position.copy(savedCamPos);camera.quaternion.copy(savedCamQuat);
+      if(hud)hud.visible=false;hudTrace.visible=false;
+      if(vrMark)vrMark.visible=false;if(vrHint)vrHint.visible=false;
+      vrCtrls.forEach(function(c){if(c.userData.line)c.userData.line.visible=false});
+      vrDown[0]=vrDown[1]=false;resize();
+    }
     b.onclick=function(){
-      if(renderer.xr.isPresenting){renderer.xr.getSession().end();return}
-      navigator.xr.requestSession('immersive-vr',{optionalFeatures:['local-floor']}).then(function(s){
-        var p=new T.Vector3();camera.getWorldPosition(p);if(mode==='orbit')p.copy(orb.t).add(new T.Vector3(0,0,8));
-        renderer.xr.setReferenceSpaceType('local-floor');renderer.xr.setSession(s);rig.position.set(p.x,0,p.z);camera.position.set(0,0,0);camera.rotation.set(0,0,0);b.textContent='Exit VR';if(hud)hud.visible=true;
-        s.addEventListener('end',function(){b.textContent='Enter VR';rig.position.set(0,0,0);rig.rotation.set(0,0,0);if(hud)hud.visible=false;hudTrace.visible=false;resize()});
-      }).catch(function(){b.textContent='VR blocked here';b.disabled=true});
+      if(renderer.xr.isPresenting){var live=renderer.xr.getSession();if(live){var end=live.end();if(end&&end.catch)end.catch(function(){})}return}
+      if(b.disabled)return;
+      b.disabled=true;b.textContent='Starting VR';
+      navigator.xr.requestSession('immersive-vr',{optionalFeatures:['local-floor','hand-tracking']}).then(function(session){
+        renderer.xr.enabled=true;renderer.xr.setReferenceSpaceType('local-floor');
+        return renderer.xr.setSession(session).then(function(){
+          savedCamPos.copy(camera.position);savedCamQuat.copy(camera.quaternion);
+          var spot=vrEntryPoint(),face=mode==='walk'?walk.yaw:Math.atan2(-(orb.t.x-spot.x),-(orb.t.z-spot.z));
+          fly=null;vrLearned=false;snapReady=true;vrDown[0]=vrDown[1]=false;
+          rig.position.set(spot.x,0,spot.z);rig.rotation.set(0,face,0);
+          camera.position.set(0,0,0);camera.rotation.set(0,0,0);
+          b.textContent='Exit VR';b.disabled=false;if(hud)hud.visible=true;if(vrHint)vrHint.visible=true;
+          session.addEventListener('end',endVR);
+        }).catch(function(){b.textContent='View in VR';b.disabled=false;try{var end=session.end();if(end&&end.catch)end.catch(function(){})}catch(e){}});
+      }).catch(function(){b.textContent='View in VR';b.disabled=false});
     };
   }).catch(function(){});
 })();
-var snapReady=true;
 function vrMove(dt){
-  var s=renderer.xr.getSession();if(!s)return;var xc=renderer.xr.getCamera(camera),f=new T.Vector3();xc.getWorldDirection(f);f.y=0;f.normalize();var r=new T.Vector3(-f.z,0,f.x);
-  for(var i=0;i<s.inputSources.length;i++){var src=s.inputSources[i],gp=src.gamepad;if(!gp||gp.axes.length<4)continue;var ax=gp.axes[2],ay=gp.axes[3];
-    if(src.handedness==='left'){if(Math.abs(ax)>.15)rig.position.addScaledVector(r,ax*2.5*dt);if(Math.abs(ay)>.15)rig.position.addScaledVector(f,-ay*2.5*dt)}
-    else{if(Math.abs(ax)>.7&&snapReady){rig.rotateY(-Math.sign(ax)*Math.PI/6);snapReady=false}if(Math.abs(ax)<.3)snapReady=true}}
-  if(selected&&hud){var a=machines[selected].center,b=new T.Vector3();hud.getWorldPosition(b);var p=hudTrace.geometry.attributes.position;p.setXYZ(0,a.x,machines[selected].m.h,a.z);p.setXYZ(1,b.x,b.y,b.z);p.needsUpdate=true;hudTrace.visible=true}else hudTrace.visible=false;
+  var session=renderer.xr.getSession();if(!session||!vrCtrls.length)return;
+  if(!(dt>0))dt=0;dt=Math.min(dt,.1);
+  renderer.xr.getCamera(camera);camera.getWorldDirection(vrFwd);vrFwd.y=0;
+  if(vrFwd.lengthSq()>1e-6)vrFwd.normalize();else vrFwd.set(0,0,-1);
+  vrRight.set(-vrFwd.z,0,vrFwd.x);
+  var i,src,st,ax,ay,speed=3*dt,didLeft=false,didSnap=false,best=null;
+  for(i=0;i<vrCtrls.length&&i<session.inputSources.length;i++){
+    src=session.inputSources[i];if(!src)continue;
+    var tm=src.targetRayMode||'';
+    if(tm==='screen'||tm==='transient-pointer'||tm==='gaze')continue;
+    if(src.handedness!=='left'&&src.handedness!=='right')continue;
+    st=thumbstick(src.gamepad);if(!st)continue;ax=st.x;ay=st.y;
+    if(src.handedness==='left'&&!didLeft){
+      if(Math.abs(ax)>.15)rig.position.addScaledVector(vrRight,ax*speed);
+      if(Math.abs(ay)>.15)rig.position.addScaledVector(vrFwd,-ay*speed);
+      if(Math.abs(ax)>.15||Math.abs(ay)>.15)vrLearned=true;didLeft=true;
+    }else if(src.handedness==='right'&&!didSnap){
+      if(Math.abs(ax)>.75&&snapReady){rig.rotateY(-Math.sign(ax)*Math.PI/6);snapReady=false;vrLearned=true}
+      if(Math.abs(ax)<.3)snapReady=true;didSnap=true;
+    }
+  }
+  rig.position.y=0;rig.updateMatrixWorld(true);
+  if(vrAimMat)vrAimMat.color.set(S.acc);
+  for(i=0;i<vrCtrls.length;i++){
+    var c=vrCtrls[i],line=c.userData.line;src=session.inputSources[i];
+    if(!src||!c.visible||src.targetRayMode==='screen'){vrDown[i]=false;if(line)line.visible=false;continue}
+    if(line)line.visible=true;
+    aimVR(c);
+    var down=triggerDown(src),edge=down&&!vrDown[i];
+    if(c.visible)vrDown[i]=down;
+    var hit=classifyAim();
+    if(hit.floor&&(!best||hit.floor.dist<best.dist))best=hit.floor;
+    if(edge){
+      if(hit.machine&&(!hit.floor||hit.machine.dist<=hit.floor.dist))select(hit.machine.id);
+      else if(hit.floor){teleportTo(hit.floor.x,hit.floor.z);vrLearned=true}
+    }
+  }
+  if(vrMark){if(best){vrMark.visible=true;vrMark.position.set(best.x,.03,best.z)}else vrMark.visible=false}
+  if(vrHint)vrHint.visible=!vrLearned&&!selected;
+  if(selected&&hud){var mc=machines[selected].center,hp=hudTrace.geometry.attributes.position;hud.getWorldPosition(vrHead);hp.setXYZ(0,mc.x,machines[selected].m.h,mc.z);hp.setXYZ(1,vrHead.x,vrHead.y,vrHead.z);hp.needsUpdate=true;hudTrace.material.color.set(S.acc);hudTrace.visible=true}else hudTrace.visible=false;
 }
 
 /* ---------- UI wiring ---------- */
@@ -1451,7 +1580,7 @@ var last=performance.now(), cp=new T.Vector3(), tick=0;
 renderer.setAnimationLoop(function(now){
   var dt=Math.min(.1,(now-last)/1000);last=now;tick++;
   if(renderer.xr.isPresenting)vrMove(dt);
-  else{
+  else{if(vrMark)vrMark.visible=false;if(vrHint)vrHint.visible=false;
     if(fly){var k=Math.min(1,(now-fly.t0)/650),e=k*k*(3-2*k);orb.t.lerpVectors(fly.a,fly.b,e);orb.d=fly.d0+(fly.d1-fly.d0)*e;if(k>=1)fly=null}
     if(mode==='walk'){var sp=(keys.shift?7:3)*dt,fx=-Math.sin(walk.yaw),fz=-Math.cos(walk.yaw),mf=(keys.w||keys.arrowup?1:0)-(keys.s||keys.arrowdown?1:0)-joy.y,ms=(keys.d||keys.arrowright?1:0)-(keys.a||keys.arrowleft?1:0)+joy.x;
       camera.position.x+=(fx*mf-fz*ms)*sp;camera.position.z+=(fz*mf+fx*ms)*sp;camera.position.y=1.7}
